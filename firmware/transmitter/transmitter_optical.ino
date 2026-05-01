@@ -9,13 +9,11 @@
  *   TOTX173: VCC -> 5V через резистор 220Ω, GND -> GND, IN -> TX (D1)
  *   Home Button: D2 -> GND
  *
- * Wiring (Vishay VTLT1A00):
- *   VTLT1A00: VCC -> 5V, GND -> GND, ANODE -> TX (D1)
- *   (Катод LED через резистор к TX)
+ * v2.0 - Security fixes applied
  */
 
 #include <Wire.h>
-#include <SoftwareSerial.h>
+#include <avr/wdt.h>
 
 // ================= CONFIG =================
 const int HOME_PIN = 2;
@@ -23,22 +21,30 @@ const int OPTICAL_TX_PIN = 1;  // Hardware TX на Nano
 const int BAUD_RATE = 115200;
 
 // Маджвик фильтр
-const float beta = 0.1f;
-const float sampleFreq = 100.0f;
+const float BETA = 0.1f;
+const float SAMPLE_FREQ = 100.0f;
+
+// MPU-6050 константы
+const float ACCEL_SCALE = 16384.0f;
+const float GYRO_SCALE = 131.0f;
+const int MPU_ADDR = 0x68;
 
 // Серво пределы
 const int SERVO_MIN = 0;
 const int SERVO_MAX = 180;
 const int SERVO_CENTER = 90;
+const int SERVO_RANGE = 100;
 
 const int HOME_THRESHOLD = 5;
+const uint8_t MAX_YAW_VALUE = 100;
+const uint8_t MAX_PITCH_VALUE = 100;
 
 // ================= VARIABLES =================
 struct __attribute__((packed)) {
-    uint16_t yaw;   // 0-100
-    uint16_t pitch; // 0-100
+    uint16_t yaw;    // 0-100
+    uint16_t pitch;  // 0-100
     uint8_t home;
-    uint8_t checksum;  // Простая контрольная сумма
+    uint8_t checksum;
 } txData;
 
 // Маджвик
@@ -46,10 +52,13 @@ float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
 float roll = 0.0f, pitch = 0.0f, yaw = 0.0f;
 float rollOffset = 0.0f, pitchOffset = 0.0f, yawOffset = 0.0f;
 
-bool calibrateRequested = false;
+volatile bool calibrateRequested = false;
+
+// Debounce
+uint32_t lastButtonTime = 0;
+const uint32_t DEBOUNCE_MS = 50;
 
 // MPU-6050
-const int MPU_ADDR = 0x68;
 struct {
     int16_t ax, ay, az;
     int16_t gx, gy, gz;
@@ -127,14 +136,14 @@ void madgwickUpdate(float gx, float gy, float gz, float ax, float ay, float az) 
         if (recipNorm > 0.0f) {
             recipNorm = 1.0f / recipNorm;
             s0 *= recipNorm; s1 *= recipNorm; s2 *= recipNorm; s3 *= recipNorm;
-            qDot1 -= beta * s0; qDot2 -= beta * s1; qDot3 -= beta * s2; qDot4 -= beta * s3;
+            qDot1 -= BETA * s0; qDot2 -= BETA * s1; qDot3 -= BETA * s2; qDot4 -= BETA * s3;
         }
     }
 
-    q0 += qDot1 * (1.0f / sampleFreq);
-    q1 += qDot2 * (1.0f / sampleFreq);
-    q2 += qDot3 * (1.0f / sampleFreq);
-    q3 += qDot4 * (1.0f / sampleFreq);
+    q0 += qDot1 * (1.0f / SAMPLE_FREQ);
+    q1 += qDot2 * (1.0f / SAMPLE_FREQ);
+    q2 += qDot3 * (1.0f / SAMPLE_FREQ);
+    q3 += qDot4 * (1.0f / SAMPLE_FREQ);
 
     recipNorm = sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
     if (recipNorm > 0.0f) {
@@ -145,6 +154,7 @@ void madgwickUpdate(float gx, float gy, float gz, float ax, float ay, float az) 
     roll = atan2(2.0f * (q0 * q1 + q2 * q3), 1.0f - 2.0f * (q1 * q1 + q2 * q2));
     pitch = asin(2.0f * (q0 * q2 - q3 * q1));
     yaw = atan2(2.0f * (q0 * q3 + q1 * q2), 1.0f - 2.0f * (q2 * q2 + q3 * q3));
+
     roll *= 180.0f / PI;
     pitch *= 180.0f / PI;
     yaw *= 180.0f / PI;
@@ -163,16 +173,18 @@ uint8_t calcChecksum() {
 // ================= CALIBRATION =================
 void calibrate() {
     readMPU();
-    float ax = mpuData.ax / 16384.0f;
-    float ay = mpuData.ay / 16384.0f;
-    float az = mpuData.az / 16384.0f;
-    float gx = mpuData.gx / 131.0f;
-    float gy = mpuData.gy / 131.0f;
-    float gz = mpuData.gz / 131.0f;
+
+    float ax = mpuData.ax / ACCEL_SCALE;
+    float ay = mpuData.ay / ACCEL_SCALE;
+    float az = mpuData.az / ACCEL_SCALE;
+    float gx = mpuData.gx / GYRO_SCALE;
+    float gy = mpuData.gy / GYRO_SCALE;
+    float gz = mpuData.gz / GYRO_SCALE;
 
     for (int i = 0; i < 100; i++) {
         madgwickUpdate(gx, gy, gz, ax, ay, az);
         delay(5);
+        wdt_reset();
     }
 
     rollOffset = roll;
@@ -180,18 +192,26 @@ void calibrate() {
     yawOffset = yaw;
 }
 
+// ================= BUTTON ISR =================
+void homeButtonISR() {
+    uint32_t now = millis();
+    if (now - lastButtonTime > DEBOUNCE_MS) {
+        calibrateRequested = true;
+        lastButtonTime = now;
+    }
+}
+
 // ================= SETUP =================
 void setup() {
     Serial.begin(BAUD_RATE);
 
     pinMode(HOME_PIN, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(HOME_PIN), []() {
-        calibrateRequested = true;
-    }, FALLING);
+    attachInterrupt(digitalPinToInterrupt(HOME_PIN), homeButtonISR, FALLING);
 
     initMPU();
 
-    // Начальная калибровка
+    wdt_enable(WDTO_2S);
+
     Serial.println("Калибровка...");
     delay(2000);
     calibrate();
@@ -201,6 +221,8 @@ void setup() {
 
 // ================= LOOP =================
 void loop() {
+    wdt_reset();
+
     if (calibrateRequested) {
         calibrateRequested = false;
         calibrate();
@@ -210,12 +232,12 @@ void loop() {
 
     readMPU();
 
-    float ax = mpuData.ax / 16384.0f;
-    float ay = mpuData.ay / 16384.0f;
-    float az = mpuData.az / 16384.0f;
-    float gx = mpuData.gx / 131.0f;
-    float gy = mpuData.gy / 131.0f;
-    float gz = mpuData.gz / 131.0f;
+    float ax = mpuData.ax / ACCEL_SCALE;
+    float ay = mpuData.ay / ACCEL_SCALE;
+    float az = mpuData.az / ACCEL_SCALE;
+    float gx = mpuData.gx / GYRO_SCALE;
+    float gy = mpuData.gy / GYRO_SCALE;
+    float gz = mpuData.gz / GYRO_SCALE;
 
     madgwickUpdate(gx, gy, gz, ax, ay, az);
 
@@ -229,17 +251,12 @@ void loop() {
     bool inHome = (abs(servoYaw - SERVO_CENTER) < HOME_THRESHOLD) &&
                   (abs(servoPitch - SERVO_CENTER) < HOME_THRESHOLD);
 
-    txData.yaw = (uint16_t)(servoYaw / 1.8);
-    txData.pitch = (uint16_t)(servoPitch / 1.8);
+    txData.yaw = (uint16_t)map(servoYaw, 0, 180, 0, SERVO_RANGE);
+    txData.pitch = (uint16_t)map(servoPitch, 0, 180, 0, SERVO_RANGE);
     txData.home = inHome ? 1 : 0;
     txData.checksum = calcChecksum();
 
-    // Отправка через оптоволокно
     Serial.write((uint8_t*)&txData, sizeof(txData));
-
-    // Дебаг
-    // Serial.print("Y:"); Serial.print(servoYaw);
-    // Serial.print(" P:"); Serial.println(servoPitch);
 
     delay(10);
 }
