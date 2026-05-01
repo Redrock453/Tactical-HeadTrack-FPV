@@ -1,0 +1,6 @@
+# Arduino Libraries
+# Install via Arduino IDE Library Manager
+
+- Wire (built-in)
+- SPI (built-in)
+- RF24 by TMRh20
